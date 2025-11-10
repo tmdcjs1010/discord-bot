@@ -1,21 +1,14 @@
+// ---------- 기본 모듈 ----------
 const express = require("express");
+const { Client, GatewayIntentBits, AttachmentBuilder } = require("discord.js");
+
+// ---------- Express 서버 (Render가 포트 인식용으로 필요) ----------
 const app = express();
+const PORT = process.env.PORT || 3000;
+app.get("/", (req, res) => res.send("Bot is alive! ✅"));
+app.listen(PORT, () => console.log(`🌐 Web server running on port ${PORT}`));
 
-app.get("/", (req, res) => {
-  res.send("Bot is alive!");
-});
-
-app.listen(3000, () => {
-  console.log("🌐 Express server running on port 3000");
-});
-
-
-// index.js  (CommonJS 버전, Node 18+ 권장: global fetch 사용)
-const { Client, GatewayIntentBits, AttachmentBuilder } = require('discord.js');
-
-// ✅ 스포일러 강제 적용할 채널 ID
-const SPOILER_CHANNEL_ID = '1421086622773936300';
-
+// ---------- Discord 클라이언트 설정 ----------
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -24,60 +17,81 @@ const client = new Client({
   ],
 });
 
-client.once('ready', () => {
-  console.log(`✅ Logged in as ${client.user.tag}`);
+// ---------- 채널 ID ----------
+const SPOILER_CHANNEL_ID = "1421086622773936300";
+
+// ---------- 로그인 재시도 로직 ----------
+async function loginBot(retryCount = 0) {
+  try {
+    await client.login(process.env.DISCORD_TOKEN);
+    console.log("✅ Discord bot login successful");
+  } catch (err) {
+    console.error("❌ Login failed:", err.message);
+    if (retryCount < 5) {
+      const wait = (retryCount + 1) * 5000; // 점점 늘어나는 재시도 간격
+      console.log(`🔁 Retrying login in ${wait / 1000} sec...`);
+      setTimeout(() => loginBot(retryCount + 1), wait);
+    } else {
+      console.error("⛔ Too many login failures. Will try again in 10 minutes.");
+      setTimeout(() => loginBot(0), 10 * 60 * 1000);
+    }
+  }
+}
+
+// ---------- 이벤트: 봇 준비 완료 ----------
+client.once("ready", () => {
+  console.log(`🤖 Logged in as ${client.user.tag}`);
   console.log(`🎯 Target channel: ${SPOILER_CHANNEL_ID}`);
 });
 
-client.on('messageCreate', async (msg) => {
+// ---------- 이벤트: 메시지 생성 시 ----------
+client.on("messageCreate", async (msg) => {
   try {
-    if (msg.author.bot) return;                           // 봇 메시지 무시
-    if (msg.channel.id !== SPOILER_CHANNEL_ID) return;    // 지정 채널만 처리
+    if (msg.author.bot) return;
+    if (msg.channel.id !== SPOILER_CHANNEL_ID) return;
 
-    // 권한 체크 (로그로 원인 파악)
     const me = await msg.guild.members.fetchMe();
     const perms = msg.channel.permissionsFor(me);
-    if (!perms?.has(['ViewChannel','SendMessages','ReadMessageHistory'])) {
-      console.log('⚠️ 권한 부족(View/Send/ReadMessageHistory)');
-      return;
-    }
-    const canManage = perms.has('ManageMessages');
-    const canAttach = perms.has('AttachFiles');
+    if (!perms?.has(["ViewChannel", "SendMessages", "ReadMessageHistory"])) return;
 
-    // 작성자 표시 + 텍스트 스포일러 처리
+    const canManage = perms.has("ManageMessages");
+    const canAttach = perms.has("AttachFiles");
+
     const prefix = `${msg.member?.displayName ?? msg.author.username}: `;
-    const text = (msg.content ?? '').trim();
-    const spoilerText = text ? `||${text}||` : '';
+    const text = (msg.content ?? "").trim();
+    const spoilerText = text ? `||${text}||` : "";
 
-    // 첨부파일 스포일러: 파일명에 SPOILER_ 접두어 붙여 재업로드
     const files = [];
     for (const [, att] of msg.attachments) {
-      if (!canAttach) {
-        console.log('⚠️ AttachFiles 권한 없음 → 첨부 스킵');
-        continue;
-      }
+      if (!canAttach) continue;
       const res = await fetch(att.url);
       const buf = Buffer.from(await res.arrayBuffer());
       files.push(new AttachmentBuilder(buf, { name: `SPOILER_${att.name}` }));
     }
 
-    if (!spoilerText && files.length === 0) {
-      console.log('ℹ️ 텍스트/첨부 없음 → 전송 스킵');
-      return;
-    }
+    if (!spoilerText && files.length === 0) return;
 
     await msg.channel.send({ content: `${prefix}${spoilerText}`, files });
-    console.log('✅ 스포일러 메시지 전송 완료');
-
-    if (canManage) {
-      await msg.delete().catch(e => console.log('⚠️ 원본 삭제 실패:', e.message));
-    } else {
-      console.log('⚠️ ManageMessages 권한 없음 → 원본 삭제 스킵');
-    }
-  } catch (e) {
-    console.error('❌ spoiler bot error:', e);
+    if (canManage) await msg.delete().catch(() => {});
+  } catch (err) {
+    console.error("💥 Message handler error:", err);
   }
 });
 
-// 🔑 Replit의 Secrets(환경변수)에서 DISCORD_TOKEN 추가해두세요.
-client.login(process.env.DISCORD_TOKEN);
+// ---------- 예외 처리 ----------
+process.on("unhandledRejection", (reason, p) => {
+  console.error("🚨 Unhandled Rejection:", reason);
+});
+process.on("uncaughtException", (err) => {
+  console.error("💥 Uncaught Exception:", err);
+});
+client.on("shardDisconnect", (event, id) => {
+  console.warn(`⚠️ Shard ${id} disconnected — attempting reconnect...`);
+  loginBot();
+});
+client.on("error", (err) => {
+  console.error("⚙️ Discord client error:", err.message);
+});
+
+// ---------- 실행 ----------
+loginBot();
