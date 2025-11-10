@@ -1,14 +1,14 @@
-// ---------- 기본 모듈 ----------
+// --------- deps ----------
 const express = require("express");
 const { Client, GatewayIntentBits, AttachmentBuilder } = require("discord.js");
 
-// ---------- Express 서버 (Render가 포트 인식용으로 필요) ----------
+// --------- tiny web server (Render port binding) ----------
 const app = express();
 const PORT = process.env.PORT || 3000;
-app.get("/", (req, res) => res.send("Bot is alive! ✅"));
-app.listen(PORT, () => console.log(`🌐 Web server running on port ${PORT}`));
+app.get("/", (_req, res) => res.send("Bot is alive ✅"));
+app.listen(PORT, () => console.log(`🌐 Web server on :${PORT}`));
 
-// ---------- Discord 클라이언트 설정 ----------
+// --------- discord client ----------
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -17,42 +17,63 @@ const client = new Client({
   ],
 });
 
-// ---------- 채널 ID ----------
 const SPOILER_CHANNEL_ID = "1421086622773936300";
 
-// ---------- 로그인 재시도 로직 ----------
-async function loginBot(retryCount = 0) {
+// --------- single-flight login with backoff ----------
+let loggingIn = false;
+let loggedOnce = false;
+let backoffMs = 5_000;        // 5s부터
+const MAX_BACKOFF = 10 * 60_000; // 10분
+
+async function safeLogin(force = false) {
+  if (loggingIn && !force) return;
+  loggingIn = true;
   try {
+    console.log("🔐 Trying to login...");
     await client.login(process.env.DISCORD_TOKEN);
-    console.log("✅ Discord bot login successful");
-  } catch (err) {
-    console.error("❌ Login failed:", err.message);
-    if (retryCount < 5) {
-      const wait = (retryCount + 1) * 5000; // 점점 늘어나는 재시도 간격
-      console.log(`🔁 Retrying login in ${wait / 1000} sec...`);
-      setTimeout(() => loginBot(retryCount + 1), wait);
-    } else {
-      console.error("⛔ Too many login failures. Will try again in 10 minutes.");
-      setTimeout(() => loginBot(0), 10 * 60 * 1000);
-    }
+    console.log("✅ Login OK");
+    backoffMs = 5_000; // 성공하면 초기화
+  } catch (e) {
+    console.error("❌ Login failed:", e?.message || e);
+    // 다음 재시도 예약 (지수백오프 상한 10분)
+    setTimeout(() => safeLogin(false), backoffMs);
+    backoffMs = Math.min(backoffMs * 2, MAX_BACKOFF);
+  } finally {
+    loggingIn = false;
   }
 }
 
-// ---------- 이벤트: 봇 준비 완료 ----------
+// --------- lifecycle handlers ----------
 client.once("ready", () => {
   console.log(`🤖 Logged in as ${client.user.tag}`);
   console.log(`🎯 Target channel: ${SPOILER_CHANNEL_ID}`);
+  loggedOnce = true;
 });
 
-// ---------- 이벤트: 메시지 생성 시 ----------
+// 게이트웨이 단절/오류시 자동 복구
+function scheduleReconnect(reason) {
+  console.warn(`⚠️ Reconnect scheduled (${reason}).`);
+  // 중복 로그인 방지: 현재 세션 정리 후 재로그인
+  try { client.destroy(); } catch {}
+  setTimeout(() => safeLogin(true), 5_000);
+}
+
+client.on("shardDisconnect", (_event, id) => scheduleReconnect(`shard ${id} disconnect`));
+client.on("shardError", (err, id) => { console.error(`💥 shard ${id} error:`, err?.message || err); scheduleReconnect("shardError"); });
+client.on("error", (err) => { console.error("💥 client error:", err?.message || err); if (loggedOnce) scheduleReconnect("client error"); });
+
+// 프로세스 레벨 예외도 죽지 않게
+process.on("unhandledRejection", (r) => { console.error("🚨 UnhandledRejection:", r); if (loggedOnce) scheduleReconnect("unhandledRejection"); });
+process.on("uncaughtException", (e) => { console.error("💥 UncaughtException:", e); if (loggedOnce) scheduleReconnect("uncaughtException"); });
+
+// --------- main logic (spoiler-enforcer) ----------
 client.on("messageCreate", async (msg) => {
   try {
-    if (msg.author.bot) return;
-    if (msg.channel.id !== SPOILER_CHANNEL_ID) return;
+    if (msg.author.bot || msg.channel.id !== SPOILER_CHANNEL_ID) return;
 
     const me = await msg.guild.members.fetchMe();
     const perms = msg.channel.permissionsFor(me);
-    if (!perms?.has(["ViewChannel", "SendMessages", "ReadMessageHistory"])) return;
+    if (!perms?.has(["ViewChannel","SendMessages","ReadMessageHistory"])) return;
 
     const canManage = perms.has("ManageMessages");
     const canAttach = perms.has("AttachFiles");
@@ -72,26 +93,14 @@ client.on("messageCreate", async (msg) => {
     if (!spoilerText && files.length === 0) return;
 
     await msg.channel.send({ content: `${prefix}${spoilerText}`, files });
-    if (canManage) await msg.delete().catch(() => {});
+    if (canManage) await msg.delete().catch(()=>{});
   } catch (err) {
-    console.error("💥 Message handler error:", err);
+    console.error("🧩 handler error:", err?.message || err);
   }
 });
 
-// ---------- 예외 처리 ----------
-process.on("unhandledRejection", (reason, p) => {
-  console.error("🚨 Unhandled Rejection:", reason);
-});
-process.on("uncaughtException", (err) => {
-  console.error("💥 Uncaught Exception:", err);
-});
-client.on("shardDisconnect", (event, id) => {
-  console.warn(`⚠️ Shard ${id} disconnected — attempting reconnect...`);
-  loginBot();
-});
-client.on("error", (err) => {
-  console.error("⚙️ Discord client error:", err.message);
-});
+// --------- kick off ----------
+safeLogin();
 
-// ---------- 실행 ----------
-loginBot();
+// 가끔 상태 로그(10분마다) — 살아있는지 확인용
+setInterval(() => console.log("⏱️ heartbeat – bot should be alive"), 10 * 60_000);
