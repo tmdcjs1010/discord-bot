@@ -28,35 +28,18 @@ async function loginBot() {
   }
 }
 
-// ---------- 30분마다 강제 재로그인 ----------
 // ---------- 1분마다 ping (세션 유지용) ----------
 setInterval(() => {
   try {
-    if (!client || !client.ws) return; // 초기화 중일 땐 skip
-    const latency = typeof client.ws.ping === "number" ? client.ws.ping : null;
-
-    if (latency !== null) {
-      console.log(`💓 Keepalive ping (1min) – ${latency}ms`);
-    } else {
+    if (!client?.ws || typeof client.ws.ping !== "number") {
       console.log("💓 Keepalive ping (1min) – waiting for ws ready...");
+      return;
     }
-
-    if (client.isReady()) {
-      client.user.setPresence({ status: "online" });
-    }
-  } catch (err) {
-    // 이제 이 에러는 거의 안 뜸
-    console.error("Ping check error (ignored):", err.message);
-  }
-}, 60 * 1000);
-
-// ---------- 1분마다 ping (세션 유지용) ----------
-setInterval(() => {
-  try {
-    client.ws.ping(); // 게이트웨이에 ping
-    console.log("💓 Keepalive ping (1min)");
-  } catch (err) {
-    console.error("Ping error:", err.message);
+    const latency = client.ws.ping;
+    console.log(`💓 Keepalive ping (1min) – ${latency}ms`);
+    if (client.isReady()) client.user.setPresence({ status: "online" });
+  } catch {
+    /* ws 초기화 중일 땐 그냥 무시 */
   }
 }, 60 * 1000);
 
