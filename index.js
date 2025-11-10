@@ -29,16 +29,27 @@ async function loginBot() {
 }
 
 // ---------- 30분마다 강제 재로그인 ----------
+// ---------- 1분마다 ping (세션 유지용) ----------
 setInterval(() => {
   try {
-    const latency = client.ws.ping; // 게이트웨이와의 왕복 지연(ms)
-    console.log(`💓 Keepalive ping (1min) – ${latency}ms`);
-    // Discord 서버에 간단한 요청을 보내 세션 유효성 유지
-    if (client.isReady()) client.user.setPresence({ status: "online" });
+    if (!client || !client.ws) return; // 초기화 중일 땐 skip
+    const latency = typeof client.ws.ping === "number" ? client.ws.ping : null;
+
+    if (latency !== null) {
+      console.log(`💓 Keepalive ping (1min) – ${latency}ms`);
+    } else {
+      console.log("💓 Keepalive ping (1min) – waiting for ws ready...");
+    }
+
+    if (client.isReady()) {
+      client.user.setPresence({ status: "online" });
+    }
   } catch (err) {
-    console.error("Ping check error:", err.message);
+    // 이제 이 에러는 거의 안 뜸
+    console.error("Ping check error (ignored):", err.message);
   }
 }, 60 * 1000);
+
 // ---------- 1분마다 ping (세션 유지용) ----------
 setInterval(() => {
   try {
