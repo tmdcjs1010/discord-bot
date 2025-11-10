@@ -53,10 +53,13 @@ client.once("ready", () => {
 // 게이트웨이 단절/오류시 자동 복구
 function scheduleReconnect(reason) {
   console.warn(`⚠️ Reconnect scheduled (${reason}).`);
-  // 중복 로그인 방지: 현재 세션 정리 후 재로그인
   try { client.destroy(); } catch {}
-  setTimeout(() => safeLogin(true), 5_000);
+  setTimeout(() => {
+    console.log("🔁 Forcing re-login...");
+    safeLogin(true);
+  }, 1000); // 1초 후 재로그인
 }
+
 
 client.on("shardDisconnect", (_event, id) => scheduleReconnect(`shard ${id} disconnect`));
 client.on("shardError", (err, id) => { console.error(`💥 shard ${id} error:`, err?.message || err); scheduleReconnect("shardError"); });
