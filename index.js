@@ -30,11 +30,15 @@ async function loginBot() {
 
 // ---------- 30분마다 강제 재로그인 ----------
 setInterval(() => {
-  console.log("🔄 Auto re-login (30min refresh)");
-  try { client.destroy(); } catch {}
-  loginBot();
-}, 30 * 60 * 1000);
-
+  try {
+    const latency = client.ws.ping; // 게이트웨이와의 왕복 지연(ms)
+    console.log(`💓 Keepalive ping (1min) – ${latency}ms`);
+    // Discord 서버에 간단한 요청을 보내 세션 유효성 유지
+    if (client.isReady()) client.user.setPresence({ status: "online" });
+  } catch (err) {
+    console.error("Ping check error:", err.message);
+  }
+}, 60 * 1000);
 // ---------- 1분마다 ping (세션 유지용) ----------
 setInterval(() => {
   try {
