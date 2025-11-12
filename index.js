@@ -28,6 +28,9 @@ const client = new Client({
 
 // ---------- settings ----------
 const SPOILER_CHANNEL_ID = "1421086622773936300";
+const RAW_DELAY_MS = 300;         // raw 백업 지연
+const DUPE_WINDOW_MS = 5_000;     // 최근 중복 판단 시간창
+const DUPE_FETCH_LIMIT = 10;      // 최근 몇 개 확인할지
 
 // ---------- login manager (token hard-set + event-driven relogin) ----------
 let loggingIn = false;
@@ -37,22 +40,13 @@ async function safeLogin(reason = "manual") {
   try {
     const token = process.env.DISCORD_TOKEN;
     if (!token) throw new Error("DISCORD_TOKEN is empty");
-
     console.log(`🔐 safeLogin start (${reason})`);
-
-    // REST 토큰 선세팅(일부 환경 초기 레이스 회피)
     try { client.rest.setToken(token); } catch {}
-
-    // 게이트웨이가 완전 끊긴 상태면 정리
     if (client.ws?.status === Status.Disconnected) {
       try { await client.destroy(); } catch {}
     }
-
     await client.login(token);
-
-    // login 이후에도 한 번 더 세팅
     try { client.rest.setToken(token); } catch {}
-
     console.log("✅ safeLogin success");
   } catch (e) {
     console.error("❌ safeLogin failed:", e?.message || e);
@@ -64,7 +58,6 @@ async function loginBot() { return safeLogin("initial"); }
 
 // ---------- keepalive / watchdog ----------
 const fetchLazy = (...args) => import("node-fetch").then(({ default: fetch }) => fetch(...args));
-
 setInterval(async () => {
   try {
     if (!client?.ws || typeof client.ws.ping !== "number") {
@@ -73,15 +66,12 @@ setInterval(async () => {
     }
     console.log(`💓 Keepalive ping (1min) – ${client.ws.ping}ms`);
     if (client.isReady()) { try { client.user.setPresence({ status: "online" }); } catch {} }
-
     const selfUrl = process.env.RENDER_EXTERNAL_URL || "https://discord-bot-atg4.onrender.com";
     await fetchLazy(selfUrl).then(() => console.log("🌍 Self-ping sent"));
   } catch (err) {
     console.error("Ping task error (ignored):", err?.message || err);
   }
 }, 60 * 1000);
-
-// 게이트웨이가 완전 끊긴 경우에만 재로그인 시도
 setInterval(() => {
   if (client.ws?.status === Status.Disconnected) {
     console.warn("🛠️ Watchdog: Disconnected → safe re-login");
@@ -101,41 +91,65 @@ function wrapSpoiler(text) {
   const already = /^(\|\|)[\s\S]*\1$/.test(text.trim());
   return already ? text : `||${text}||`;
 }
+async function downloadAsAttachment(url, nameHint) {
+  const res = await fetchLazy(url);
+  const buf = Buffer.from(await res.arrayBuffer());
+  return new AttachmentBuilder(buf, { name: `SPOILER_${nameHint || "file"}` });
+}
+
+// **크로스-인스턴스 중복 방지: 최근 히스토리 검사**
+async function isRecentDuplicate({ channel, content, filesCount }) {
+  try {
+    const now = Date.now();
+    const msgs = await channel.messages.fetch({ limit: DUPE_FETCH_LIMIT }).catch(() => null);
+    if (!msgs) return false;
+    for (const [, m] of msgs) {
+      if (m.author?.id !== client.user.id) continue; // 내 봇이 올린 것만 비교
+      const age = now - m.createdTimestamp;
+      if (age > DUPE_WINDOW_MS) continue;
+      const sameContent = (m.content || "") === (content || "");
+      const sameFiles = (m.attachments?.size || 0) === (filesCount || 0);
+      if (sameContent && sameFiles) return true;
+    }
+    return false;
+  } catch { return false; }
+}
+
 async function sendSpoilerAndMaybeDelete({ channel, text, attachments, authorName, canDelete, messageId }) {
   const files = [];
   for (const att of attachments || []) {
     try {
-      const res = await fetchLazy(att.url);
-      const buf = Buffer.from(await res.arrayBuffer());
-      files.push(new AttachmentBuilder(buf, { name: `SPOILER_${att.filename || att.name || "file"}` }));
+      files.push(await downloadAsAttachment(att.url, att.filename || att.name));
     } catch (e) {
       console.error("⚠️ attachment fetch fail:", e?.message || e);
     }
   }
-
   const content = `${authorName ? authorName + ": " : ""}${wrapSpoiler(text || "")}`;
   if (!content && files.length === 0) {
     console.log("ℹ️ nothing to send (no text/attachments)");
     return;
   }
 
-  await channel.send({ content, files }).catch((e) => {
-    console.error("❌ send fail:", e?.message || e);
-  });
+  // ⛔ 크로스-인스턴스 중복 방어막
+  if (await isRecentDuplicate({ channel, content, filesCount: files.length })) {
+    console.log("🛡️ skip send — recent duplicate detected");
+  } else {
+    await channel.send({ content, files }).catch((e) => {
+      console.error("❌ send fail:", e?.message || e);
+    });
+  }
 
   if (canDelete && messageId) {
-    // 메시지 fetch 없이 ID만으로 삭제 시도
     await channel.messages.delete(messageId).catch((e) => {
       console.error("⚠️ delete fail (ignored):", e?.message || e);
     });
   }
 }
 
-// ---------- global dedupe ----------
+// ---------- global dedupe (인스턴스 내) ----------
 const processedIds = new Map(); // messageId -> ts
 function wasProcessed(id) { return processedIds.has(id); }
 function markProcessed(id) { processedIds.set(id, Date.now()); }
-// 10분 TTL 청소
 setInterval(() => {
   const now = Date.now();
   for (const [id, ts] of processedIds) {
@@ -147,8 +161,6 @@ setInterval(() => {
 client.once("ready", async () => {
   console.log(`🤖 Logged in as ${client.user.tag}`);
   console.log(`🎯 Target channel: ${SPOILER_CHANNEL_ID}`);
-
-  // 채널/권한 프로브
   try {
     const ch = await client.channels.fetch(SPOILER_CHANNEL_ID);
     const me = ch.guild?.members?.me;
@@ -164,8 +176,8 @@ client.once("ready", async () => {
       AttachFiles: has(PermissionFlagsBits.AttachFiles),
     });
 
-    // 토큰/세션 안정화 대기 후 전송권한 즉시 검증
-    await new Promise(r => setTimeout(r, 1500));
+    // 안정화 대기 후 전송권한 프로브
+    await new Promise(r => setTimeout(r, 1200));
     await ch.send("🧪 Bot write probe (will delete)");
     console.log("✅ write probe: sent");
     if (has(PermissionFlagsBits.ManageMessages)) {
@@ -231,7 +243,7 @@ client.on("messageCreate", async (msg) => {
   }
 });
 
-// ---------- FALLBACK: RAW MESSAGE_CREATE (게이트웨이 이벤트 누락 대비) ----------
+// ---------- FALLBACK: RAW MESSAGE_CREATE ----------
 client.on("raw", async (p) => {
   try {
     if (p.t !== "MESSAGE_CREATE") return;
@@ -241,13 +253,11 @@ client.on("raw", async (p) => {
     const channelId = d.channel_id;
     const messageId = d.id;
 
-    // messageCreate가 먼저 처리할 시간을 잠깐 준 뒤 확인
-    await new Promise(r => setTimeout(r, 300));
+    await new Promise(r => setTimeout(r, RAW_DELAY_MS));
     if (wasProcessed(messageId)) return;
 
     const channel = await client.channels.fetch(channelId).catch(() => null);
     if (!channel) return;
-
     if (!isParentOrSameChannel(channel, SPOILER_CHANNEL_ID)) return;
     if (d.author?.bot) return;
 
