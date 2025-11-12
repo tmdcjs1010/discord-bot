@@ -6,11 +6,10 @@ const {
   AttachmentBuilder,
   PermissionFlagsBits,
   Partials,
-  ChannelType,
   Status,
 } = require("discord.js");
 
-// ---------- tiny web server (Render port binding) ----------
+// ---------- tiny web server ----------
 const app = express();
 const PORT = process.env.PORT || 3000;
 app.get("/", (_req, res) => res.send("✅ Bot running + heartbeat alive"));
@@ -48,7 +47,7 @@ async function safeLogin(reason = "manual") {
 }
 async function loginBot() { return safeLogin("initial"); }
 
-// ---------- 1min keepalive (Discord + Render self-ping) ----------
+// ---------- keepalive / watchdog ----------
 const fetchLazy = (...args) => import("node-fetch").then(({ default: fetch }) => fetch(...args));
 setInterval(async () => {
   try {
@@ -60,12 +59,9 @@ setInterval(async () => {
     if (client.isReady()) { try { client.user.setPresence({ status: "online" }); } catch {} }
     const selfUrl = process.env.RENDER_EXTERNAL_URL || "https://discord-bot-atg4.onrender.com";
     await fetchLazy(selfUrl).then(() => console.log("🌍 Self-ping sent"));
-  } catch (err) {
-    console.error("Ping task error (ignored):", err?.message || err);
-  }
+  } catch (err) { console.error("Ping task error (ignored):", err?.message || err); }
 }, 60 * 1000);
 
-// ---------- watchdog: reconnect only when truly disconnected ----------
 setInterval(() => {
   if (client.ws?.status === Status.Disconnected) {
     console.warn("🛠️ Watchdog: Disconnected → safe re-login");
@@ -119,19 +115,24 @@ async function processSpoilerMessage(msg) {
   if (canManage) await msg.delete().catch(() => {});
 }
 
+// ---------- dedupe (processed message ids) ----------
+const processed = new Map(); // id -> timestamp
+function markProcessed(id) { processed.set(id, Date.now()); }
+function wasProcessed(id)  { return processed.has(id); }
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, ts] of processed) if (now - ts > 5 * 60 * 1000) processed.delete(id);
+}, 60 * 1000);
+
 // ---------- events ----------
 client.once("ready", async () => {
   console.log(`🤖 Logged in as ${client.user.tag}`);
   console.log(`🎯 Target channel: ${SPOILER_CHANNEL_ID}`);
 
-  // 대상 채널 타입 로깅(포럼/미디어 판별)
+  // 대상 채널 타입 로깅
   try {
     const ch = await client.channels.fetch(SPOILER_CHANNEL_ID);
-    console.log("[DBG] targetChannel", {
-      id: ch?.id,
-      type: ch?.type, // 0=Text, 15=Forum, 5=Announcement, 11/12=Threads
-      name: ch?.name,
-    });
+    console.log("[DBG] targetChannel", { id: ch?.id, type: ch?.type, name: ch?.name });
   } catch (e) {
     console.log("[DBG] targetChannel fetch fail:", e?.message || e);
   }
@@ -142,40 +143,58 @@ client.on("error", (e) => { console.error("⚙️ Discord client error:", e?.mes
 client.on("shardReconnecting", (_, id) => console.warn(`♻️ Shard ${id} reconnecting...`));
 client.on("shardResume",      (_, id) => console.log(`🔗 Shard ${id} resumed`));
 
-// --- RAW 디버그 (잠깐만 켰다가 정상 확인 후 주석 처리해도 됨)
-client.on("raw", (p) => {
-  if (p.t === "MESSAGE_CREATE" || p.t === "THREAD_CREATE") {
-    console.log("[RAW]", p.t, {
-      guild_id: p.d.guild_id,
-      channel_id: p.d.channel_id,
-      id: p.d.id,
-      thread_id: p.d.thread?.id,
-      parent_id: p.d.parent_id,
+// --- RAW: 페일세이프(최후 방어선). messageCreate가 안 올라오는 경우 직접 처리.
+client.on("raw", async (p) => {
+  try {
+    if (p.t !== "MESSAGE_CREATE") return;
+
+    const { channel_id, id: message_id, guild_id } = p.d || {};
+    // 대상 채널(부모 채널)에서만 검사. 스레드는 messageCreate에서 잡습니다.
+    if (channel_id !== SPOILER_CHANNEL_ID) return;
+    if (!client.isReady()) return;
+    if (wasProcessed(message_id)) return;
+
+    // 메시지 객체를 fetch해서 표준 파이프라인으로 처리
+    const channel = await client.channels.fetch(channel_id).catch(() => null);
+    if (!channel) return;
+    const msg = await channel.messages.fetch(message_id).catch(() => null);
+    if (!msg) return;
+
+    // 디버그
+    console.log("[DBG][RAW→FETCH] MESSAGE_CREATE fetched", {
+      guild: guild_id, channel: channel_id, id: message_id,
+      authorBot: !!msg.author?.bot, contentLen: (msg.content||"").length,
+      isThread: msg.channel?.isThread?.() || false, parentId: msg.channel?.parentId || null,
     });
+
+    if (msg.author?.bot) { markProcessed(message_id); return; }
+    if (!isTargetMessage(msg)) { markProcessed(message_id); return; }
+
+    await processSpoilerMessage(msg);
+    markProcessed(message_id);
+  } catch (e) {
+    console.error("💥 RAW handler error:", e?.message || e);
   }
 });
 
-// ★ 포럼/미디어 채널: 스레드가 생성되면 starter message 처리
+// ★ 포럼/미디어: 스레드(게시물) 생성 시 starter message 처리
 client.on("threadCreate", async (thread) => {
   try {
     if (!client.isReady()) return;
-    // 부모가 대상 채널일 때만
     if (thread.parentId !== SPOILER_CHANNEL_ID) return;
 
     console.log("[DBG] threadCreate", {
-      threadId: thread.id,
-      parentId: thread.parentId,
-      type: thread.type, // ChannelType.PublicThread/PrivateThread
-      name: thread.name,
+      threadId: thread.id, parentId: thread.parentId, type: thread.type, name: thread.name,
     });
 
-    // private thread 대비 join (공개여도 join하면 안정적)
     try { await thread.join(); } catch {}
-
     const starter = await thread.fetchStarterMessage().catch(() => null);
     if (starter && !starter.author?.bot) {
-      console.log("[DBG] process starter message", { id: starter.id, contentLen: (starter.content||"").length });
-      await processSpoilerMessage(starter);
+      if (!wasProcessed(starter.id)) {
+        console.log("[DBG] process starter message", { id: starter.id, contentLen: (starter.content||"").length });
+        await processSpoilerMessage(starter);
+        markProcessed(starter.id);
+      }
     }
   } catch (e) {
     console.error("💥 threadCreate handler error:", e?.message || e);
@@ -187,7 +206,8 @@ client.on("messageCreate", async (msg) => {
   try {
     if (!client.isReady()) return;
 
-    const info = {
+    // 필수 디버그
+    console.log("[DBG] messageCreate", {
       guild: msg.guild?.id,
       channel: msg.channel?.id,
       type: msg.channel?.type,
@@ -196,14 +216,14 @@ client.on("messageCreate", async (msg) => {
       authorBot: !!msg.author?.bot,
       contentLen: (msg.content || "").length,
       attachCnt: msg.attachments?.size || 0,
-    };
-    // 필수 디버그 (안 찍히면 이벤트 자체가 안 오는 것)
-    console.log("[DBG] messageCreate", info);
+    });
 
     if (msg.author?.bot) return;
     if (!isTargetMessage(msg)) return;
 
+    if (wasProcessed(msg.id)) return;
     await processSpoilerMessage(msg);
+    markProcessed(msg.id);
   } catch (err) {
     console.error("💥 messageCreate handler error:", err?.message || err);
   }
