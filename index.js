@@ -26,7 +26,7 @@ const client = new Client({
 // ---------- settings ----------
 const SPOILER_CHANNEL_ID = "1421086622773936300";
 
-// ---------- login manager (no periodic force relogin) ----------
+// ---------- login manager (event-driven relogin) ----------
 let loggingIn = false;
 
 async function safeLogin(reason = "manual") {
@@ -102,7 +102,7 @@ client.on("invalidated", () => {
 
 client.on("error", (e) => {
   console.error("⚙️ Discord client error:", e?.message || e);
-  // 여기선 강제 재로그인 호출하지 않음(자동 재연결에 맡김)
+  // 자동 재연결에 맡깁니다(여기서 재로그인 호출 X)
 });
 
 client.on("shardReconnecting", (_, id) => {
@@ -118,8 +118,11 @@ client.on("messageCreate", async (msg) => {
     // 세션 준비 전/재로그인 공백 보호
     if (!client.isReady()) return;
 
-    // 스레드는 처리 안 함(요청사항), 지정 채널만
-    if (msg.author.bot || msg.channel.id !== SPOILER_CHANNEL_ID) return;
+    // 대상 채널만 처리 + 포럼/미디어 채널 스레드(부모가 대상 채널)도 허용
+    const inTarget =
+      msg.channel.id === SPOILER_CHANNEL_ID ||
+      (msg.channel.isThread?.() && msg.channel.parentId === SPOILER_CHANNEL_ID);
+    if (msg.author.bot || !inTarget) return;
 
     const me = msg.guild.members.me;
     const perms = msg.channel.permissionsFor(me);
