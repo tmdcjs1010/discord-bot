@@ -9,7 +9,7 @@ const {
   Status,
 } = require("discord.js");
 
-// ---------- tiny web server ----------
+// ---------- tiny web server (Render port binding) ----------
 const app = express();
 const PORT = process.env.PORT || 3000;
 app.get("/", (_req, res) => res.send("✅ Bot running + heartbeat alive"));
@@ -29,15 +29,30 @@ const client = new Client({
 // ---------- settings ----------
 const SPOILER_CHANNEL_ID = "1421086622773936300";
 
-// ---------- login manager ----------
+// ---------- login manager (token hard-set + event-driven relogin) ----------
 let loggingIn = false;
 async function safeLogin(reason = "manual") {
   if (loggingIn) return;
   loggingIn = true;
   try {
+    const token = process.env.DISCORD_TOKEN;
+    if (!token) throw new Error("DISCORD_TOKEN is empty");
+
     console.log(`🔐 safeLogin start (${reason})`);
-    try { client.destroy(); } catch {}
-    await client.login(process.env.DISCORD_TOKEN);
+
+    // 일부 환경에서 login 이전 REST 토큰 미세팅 이슈 회피: 선제 세팅
+    try { client.rest.setToken(token); } catch {}
+
+    // Disconnected 상황만 destroy로 정리(정상 Ready 중엔 파괴하지 않음)
+    if (client.ws?.status === Status.Disconnected) {
+      try { await client.destroy(); } catch {}
+    }
+
+    await client.login(token);
+
+    // login 이후에도 한 번 더 확실히 세팅
+    try { client.rest.setToken(token); } catch {}
+
     console.log("✅ safeLogin success");
   } catch (e) {
     console.error("❌ safeLogin failed:", e?.message || e);
@@ -49,6 +64,7 @@ async function loginBot() { return safeLogin("initial"); }
 
 // ---------- keepalive / watchdog ----------
 const fetchLazy = (...args) => import("node-fetch").then(({ default: fetch }) => fetch(...args));
+
 setInterval(async () => {
   try {
     if (!client?.ws || typeof client.ws.ping !== "number") {
@@ -57,11 +73,15 @@ setInterval(async () => {
     }
     console.log(`💓 Keepalive ping (1min) – ${client.ws.ping}ms`);
     if (client.isReady()) { try { client.user.setPresence({ status: "online" }); } catch {} }
+
     const selfUrl = process.env.RENDER_EXTERNAL_URL || "https://discord-bot-atg4.onrender.com";
     await fetchLazy(selfUrl).then(() => console.log("🌍 Self-ping sent"));
-  } catch (err) { console.error("Ping task error (ignored):", err?.message || err); }
+  } catch (err) {
+    console.error("Ping task error (ignored):", err?.message || err);
+  }
 }, 60 * 1000);
 
+// 게이트웨이가 완전 끊긴 경우에만 재로그인 시도
 setInterval(() => {
   if (client.ws?.status === Status.Disconnected) {
     console.warn("🛠️ Watchdog: Disconnected → safe re-login");
@@ -92,14 +112,22 @@ async function sendSpoilerAndMaybeDelete({ channel, text, attachments, authorNam
       console.error("⚠️ attachment fetch fail:", e?.message || e);
     }
   }
+
   const content = `${authorName ? authorName + ": " : ""}${wrapSpoiler(text || "")}`;
   if (!content && files.length === 0) {
     console.log("ℹ️ nothing to send (no text/attachments)");
     return;
   }
-  await channel.send({ content, files }).catch((e) => console.error("❌ send fail:", e?.message || e));
+
+  await channel.send({ content, files }).catch((e) => {
+    console.error("❌ send fail:", e?.message || e);
+  });
+
   if (canDelete && messageId) {
-    await channel.messages.delete(messageId).catch((e) => console.error("⚠️ delete fail:", e?.message || e));
+    // 메시지 fetch 없이 ID로 바로 삭제 시도 (ManageMessages 필요)
+    await channel.messages.delete(messageId).catch((e) => {
+      console.error("⚠️ delete fail (ignored):", e?.message || e);
+    });
   }
 }
 
@@ -124,29 +152,42 @@ client.once("ready", async () => {
       AttachFiles: has(PermissionFlagsBits.AttachFiles),
     });
 
-    // 전송권한 즉시 검증(성공/실패 로그로 바로 판단)
-    try {
-      await ch.send("🧪 Bot write probe (will delete)");
-      console.log("✅ write probe: sent");
-      if (has(PermissionFlagsBits.ManageMessages)) {
-        const msgs = await ch.messages.fetch({ limit: 1 }).catch(() => null);
-        const last = msgs?.first();
-        if (last?.author?.id === client.user.id) {
-          await last.delete().catch(() => {});
-          console.log("✅ write probe: deleted");
-        }
-      } else {
-        console.log("ℹ️ ManageMessages 없음 → probe 메시지는 남아있을 수 있음");
+    // 토큰/세션 안정화 대기 후 전송권한 즉시 검증
+    await new Promise(r => setTimeout(r, 1500));
+    await ch.send("🧪 Bot write probe (will delete)");
+    console.log("✅ write probe: sent");
+    if (has(PermissionFlagsBits.ManageMessages)) {
+      const msgs = await ch.messages.fetch({ limit: 1 }).catch(() => null);
+      const last = msgs?.first();
+      if (last?.author?.id === client.user.id) {
+        await last.delete().catch(() => {});
+        console.log("✅ write probe: deleted");
       }
-    } catch (e) {
-      console.error("❌ write probe fail:", e?.message || e);
+    } else {
+      console.log("ℹ️ ManageMessages 없음 → probe 메시지는 남아있을 수 있음");
     }
   } catch (e) {
-    console.log("[DBG] targetChannel fetch fail:", e?.message || e);
+    console.error("❌ write probe fail:", e?.message || e);
   }
 });
 
-// 정상 경로
+client.on("invalidated", () => {
+  console.warn("🚫 Session invalidated → safe re-login");
+  safeLogin("invalidated");
+});
+
+client.on("error", (e) => {
+  console.error("⚙️ Discord client error:", e?.message || e);
+});
+
+client.on("shardReconnecting", (_, id) => {
+  console.warn(`♻️ Shard ${id} reconnecting...`);
+});
+client.on("shardResume",      (_, id) => {
+  console.log(`🔗 Shard ${id} resumed`);
+});
+
+// ---------- PRIMARY: messageCreate (정상 경로) ----------
 client.on("messageCreate", async (msg) => {
   try {
     if (!client.isReady()) return;
@@ -154,9 +195,12 @@ client.on("messageCreate", async (msg) => {
     if (!isParentOrSameChannel(msg.channel, SPOILER_CHANNEL_ID)) return;
 
     console.log("[DBG] messageCreate", {
-      guild: msg.guild?.id, channel: msg.channel?.id,
-      isThread: msg.channel?.isThread?.() || false, parentId: msg.channel?.parentId || null,
-      contentLen: (msg.content || "").length, attachCnt: msg.attachments?.size || 0,
+      guild: msg.guild?.id,
+      channel: msg.channel?.id,
+      isThread: msg.channel?.isThread?.() || false,
+      parentId: msg.channel?.parentId || null,
+      contentLen: (msg.content || "").length,
+      attachCnt: msg.attachments?.size || 0,
     });
 
     const me = msg.guild?.members?.me;
@@ -180,7 +224,7 @@ client.on("messageCreate", async (msg) => {
   }
 });
 
-// 최후 방어선: RAW만 와도 동작
+// ---------- FALLBACK: RAW MESSAGE_CREATE (게이트웨이 이벤트 누락 대비) ----------
 client.on("raw", async (p) => {
   try {
     if (p.t !== "MESSAGE_CREATE") return;
@@ -189,6 +233,7 @@ client.on("raw", async (p) => {
     const d = p.d || {};
     const channelId = d.channel_id;
     const messageId = d.id;
+
     const channel = await client.channels.fetch(channelId).catch(() => null);
     if (!channel) return;
 
