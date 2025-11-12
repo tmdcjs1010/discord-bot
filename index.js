@@ -6,6 +6,7 @@ const {
   AttachmentBuilder,
   PermissionFlagsBits,
   Partials,
+  ChannelType,
   Status,
 } = require("discord.js");
 
@@ -20,7 +21,7 @@ const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMembers,   // me 캐시 안정화
-    GatewayIntentBits.GuildMessages,  // messageCreate
+    GatewayIntentBits.GuildMessages,  // messageCreate (있으면 사용, 없어도 RAW로 백업)
     GatewayIntentBits.MessageContent, // 본문 처리
   ],
   partials: [Partials.Channel, Partials.Message, Partials.GuildMember, Partials.User],
@@ -29,7 +30,7 @@ const client = new Client({
 // ---------- settings ----------
 const SPOILER_CHANNEL_ID = "1421086622773936300";
 
-// ---------- login manager (event-driven relogin) ----------
+// ---------- login manager ----------
 let loggingIn = false;
 async function safeLogin(reason = "manual") {
   if (loggingIn) return;
@@ -69,67 +70,54 @@ setInterval(() => {
   }
 }, 45 * 1000);
 
-// ---------- helpers ----------
-function isTargetMessage(msg) {
-  // 1) 텍스트 채널 본문
-  if (msg.channel.id === SPOILER_CHANNEL_ID) return true;
-  // 2) 스레드(포럼/미디어 포함)인데 부모가 대상 채널
-  if (msg.channel.isThread?.() && msg.channel.parentId === SPOILER_CHANNEL_ID) return true;
+// ---------- small utils ----------
+function isParentOrSameChannel(channel, parentId) {
+  if (!channel) return false;
+  if (channel.id === parentId) return true;
+  if (channel.isThread?.() && channel.parentId === parentId) return true;
   return false;
 }
-
-async function processSpoilerMessage(msg) {
-  const me = msg.guild?.members?.me;
-  if (!me) return;
-
-  const perms = msg.channel.permissionsFor(me);
-  const required = [
-    PermissionFlagsBits.ViewChannel,
-    PermissionFlagsBits.SendMessages,
-    PermissionFlagsBits.ReadMessageHistory,
-  ];
-  if (!perms || !perms.has(required, true)) return;
-
-  const canManage = perms.has(PermissionFlagsBits.ManageMessages, true);
-  const canAttach = perms.has(PermissionFlagsBits.AttachFiles, true);
-
-  const prefix = `${msg.member?.displayName ?? msg.author.username}: `;
-  const text = (msg.content ?? "").trim();
-
-  // 이미 스포일러면 중복 감싸지 않음
-  const alreadySpoiled = /^(\|\|)[\s\S]*\1$/.test(text);
-  const spoilerText = text ? (alreadySpoiled ? text : `||${text}||`) : "";
-
-  // 첨부 재업로드(스포일러 파일명)
-  const files = [];
-  for (const [, att] of msg.attachments) {
-    if (!canAttach) continue;
-    const res = await fetchLazy(att.url);
-    const buf = Buffer.from(await res.arrayBuffer());
-    files.push(new AttachmentBuilder(buf, { name: `SPOILER_${att.name}` }));
-  }
-
-  if (!spoilerText && files.length === 0) return;
-
-  await msg.channel.send({ content: `${prefix}${spoilerText}`, files });
-  if (canManage) await msg.delete().catch(() => {});
+function wrapSpoiler(text) {
+  if (!text) return "";
+  const already = /^(\|\|)[\s\S]*\1$/.test(text.trim());
+  return already ? text : `||${text}||`;
 }
 
-// ---------- dedupe (processed message ids) ----------
-const processed = new Map(); // id -> timestamp
-function markProcessed(id) { processed.set(id, Date.now()); }
-function wasProcessed(id)  { return processed.has(id); }
-setInterval(() => {
-  const now = Date.now();
-  for (const [id, ts] of processed) if (now - ts > 5 * 60 * 1000) processed.delete(id);
-}, 60 * 1000);
+// ---------- unified spoiler sender (channel object + raw payload both 지원) ----------
+async function sendSpoilerAndDelete({ channel, text, attachments, authorName, canDelete, messageId }) {
+  const files = [];
+  for (const att of attachments || []) {
+    try {
+      const res = await fetchLazy(att.url);
+      const buf = Buffer.from(await res.arrayBuffer());
+      files.push(new AttachmentBuilder(buf, { name: `SPOILER_${att.filename || att.name || "file"}` }));
+    } catch (e) {
+      console.error("⚠️ attachment fetch fail:", e?.message || e);
+    }
+  }
+
+  const content = `${authorName ? authorName + ": " : ""}${wrapSpoiler(text || "")}`;
+  if (!content && files.length === 0) {
+    console.log("ℹ️ nothing to send (no text/attachments)");
+    return;
+  }
+
+  await channel.send({ content, files }).catch((e) => {
+    console.error("❌ send fail:", e?.message || e);
+  });
+
+  if (canDelete && messageId) {
+    // 메시지 fetch 없이 ID로 바로 삭제 시도 (ManageMessages 필요)
+    await channel.messages.delete(messageId).catch((e) => {
+      console.error("⚠️ delete fail (ignored):", e?.message || e);
+    });
+  }
+}
 
 // ---------- events ----------
 client.once("ready", async () => {
   console.log(`🤖 Logged in as ${client.user.tag}`);
   console.log(`🎯 Target channel: ${SPOILER_CHANNEL_ID}`);
-
-  // 대상 채널 타입 로깅
   try {
     const ch = await client.channels.fetch(SPOILER_CHANNEL_ID);
     console.log("[DBG] targetChannel", { id: ch?.id, type: ch?.type, name: ch?.name });
@@ -143,89 +131,112 @@ client.on("error", (e) => { console.error("⚙️ Discord client error:", e?.mes
 client.on("shardReconnecting", (_, id) => console.warn(`♻️ Shard ${id} reconnecting...`));
 client.on("shardResume",      (_, id) => console.log(`🔗 Shard ${id} resumed`));
 
-// --- RAW: 페일세이프(최후 방어선). messageCreate가 안 올라오는 경우 직접 처리.
-client.on("raw", async (p) => {
-  try {
-    if (p.t !== "MESSAGE_CREATE") return;
-
-    const { channel_id, id: message_id, guild_id } = p.d || {};
-    // 대상 채널(부모 채널)에서만 검사. 스레드는 messageCreate에서 잡습니다.
-    if (channel_id !== SPOILER_CHANNEL_ID) return;
-    if (!client.isReady()) return;
-    if (wasProcessed(message_id)) return;
-
-    // 메시지 객체를 fetch해서 표준 파이프라인으로 처리
-    const channel = await client.channels.fetch(channel_id).catch(() => null);
-    if (!channel) return;
-    const msg = await channel.messages.fetch(message_id).catch(() => null);
-    if (!msg) return;
-
-    // 디버그
-    console.log("[DBG][RAW→FETCH] MESSAGE_CREATE fetched", {
-      guild: guild_id, channel: channel_id, id: message_id,
-      authorBot: !!msg.author?.bot, contentLen: (msg.content||"").length,
-      isThread: msg.channel?.isThread?.() || false, parentId: msg.channel?.parentId || null,
-    });
-
-    if (msg.author?.bot) { markProcessed(message_id); return; }
-    if (!isTargetMessage(msg)) { markProcessed(message_id); return; }
-
-    await processSpoilerMessage(msg);
-    markProcessed(message_id);
-  } catch (e) {
-    console.error("💥 RAW handler error:", e?.message || e);
-  }
-});
-
-// ★ 포럼/미디어: 스레드(게시물) 생성 시 starter message 처리
-client.on("threadCreate", async (thread) => {
-  try {
-    if (!client.isReady()) return;
-    if (thread.parentId !== SPOILER_CHANNEL_ID) return;
-
-    console.log("[DBG] threadCreate", {
-      threadId: thread.id, parentId: thread.parentId, type: thread.type, name: thread.name,
-    });
-
-    try { await thread.join(); } catch {}
-    const starter = await thread.fetchStarterMessage().catch(() => null);
-    if (starter && !starter.author?.bot) {
-      if (!wasProcessed(starter.id)) {
-        console.log("[DBG] process starter message", { id: starter.id, contentLen: (starter.content||"").length });
-        await processSpoilerMessage(starter);
-        markProcessed(starter.id);
-      }
-    }
-  } catch (e) {
-    console.error("💥 threadCreate handler error:", e?.message || e);
-  }
-});
-
-// 스레드/본문 모든 메시지 처리(부모=대상 채널 조건)
+// ---------- PRIMARY: messageCreate (정상 경로) ----------
 client.on("messageCreate", async (msg) => {
   try {
     if (!client.isReady()) return;
+    if (msg.author?.bot) return;
 
-    // 필수 디버그
+    // 디버그
     console.log("[DBG] messageCreate", {
       guild: msg.guild?.id,
       channel: msg.channel?.id,
       type: msg.channel?.type,
       isThread: msg.channel?.isThread?.() || false,
       parentId: msg.channel?.parentId || null,
-      authorBot: !!msg.author?.bot,
       contentLen: (msg.content || "").length,
       attachCnt: msg.attachments?.size || 0,
     });
 
-    if (msg.author?.bot) return;
-    if (!isTargetMessage(msg)) return;
+    // 부모/동일 채널 판별
+    const inTarget = isParentOrSameChannel(msg.channel, SPOILER_CHANNEL_ID);
+    if (!inTarget) return;
 
-    if (wasProcessed(msg.id)) return;
-    await processSpoilerMessage(msg);
-    markProcessed(msg.id);
+    const me = msg.guild?.members?.me;
+    const perms = msg.channel.permissionsFor(me);
+    const required = [
+      PermissionFlagsBits.ViewChannel,
+      PermissionFlagsBits.SendMessages,
+    ];
+    if (!perms || !perms.has(required, true)) {
+      console.log("[DBG] skip by perms (messageCreate)", {
+        exists: !!perms,
+        bitfield: perms?.bitfield?.toString() || null,
+      });
+      return;
+    }
+    const canDelete = perms.has(PermissionFlagsBits.ManageMessages, true);
+
+    await sendSpoilerAndDelete({
+      channel: msg.channel,
+      text: msg.content || "",
+      attachments: [...msg.attachments.values()].map(a => ({ url: a.url, filename: a.name })),
+      authorName: msg.member?.displayName ?? msg.author.username,
+      canDelete,
+      messageId: msg.id,
+    });
   } catch (err) {
     console.error("💥 messageCreate handler error:", err?.message || err);
+  }
+});
+
+// ---------- FALLBACK: RAW MESSAGE_CREATE (게이트웨이 이벤트 누락/특수 권한 문제 대비) ----------
+client.on("raw", async (p) => {
+  try {
+    if (p.t !== "MESSAGE_CREATE") return;
+    if (!client.isReady()) return;
+
+    const d = p.d || {};
+    const channelId = d.channel_id;
+    const messageId = d.id;
+    const guildId = d.guild_id;
+
+    // 1) 채널 객체 확보 (본문/스레드 둘 다)
+    const channel = await client.channels.fetch(channelId).catch(() => null);
+    if (!channel) {
+      console.log("[DBG][RAW] skip: cannot fetch channel", { channelId });
+      return;
+    }
+
+    // 2) 부모/동일 채널 판별 (스레드면 parentId 검사)
+    const inTarget = isParentOrSameChannel(channel, SPOILER_CHANNEL_ID);
+    if (!inTarget) return;
+
+    // 3) 작성자 봇/권한 확인 (권한 부족이면 바로 스킵 로그)
+    const guild = channel.guild ?? (guildId ? await client.guilds.fetch(guildId).catch(() => null) : null);
+    const me = guild?.members?.me;
+    const perms = channel.permissionsFor(me);
+    if (!perms || !perms.has([PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages], true)) {
+      console.log("[DBG][RAW] skip by perms", {
+        exists: !!perms, bitfield: perms?.bitfield?.toString() || null
+      });
+      return;
+    }
+    const canDelete = perms.has(PermissionFlagsBits.ManageMessages, true);
+
+    // 4) 작성자가 봇이면 스킵
+    if (d.author?.bot) return;
+
+    // 5) RAW payload로 바로 처리 (fetch 없이)
+    const authorName = d.member?.nick || d.author?.global_name || d.author?.username || "user";
+    const text = d.content || "";
+    const atts = (d.attachments || []).map(a => ({ url: a.url, filename: a.filename || a.name }));
+
+    console.log("[DBG][RAW] processing", {
+      channelId, messageId, isThread: channel.isThread?.() || false, parentId: channel.parentId || null,
+      contentLen: text.length, attachCnt: atts.length
+    });
+
+    await sendSpoilerAndDelete({
+      channel,
+      text,
+      attachments: atts,
+      authorName,
+      canDelete,
+      messageId,
+    });
+  } catch (e) {
+    console.error("💥 RAW handler error:", e?.message || e);
   }
 });
 
