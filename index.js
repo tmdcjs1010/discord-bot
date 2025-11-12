@@ -40,17 +40,17 @@ async function safeLogin(reason = "manual") {
 
     console.log(`🔐 safeLogin start (${reason})`);
 
-    // 일부 환경에서 login 이전 REST 토큰 미세팅 이슈 회피: 선제 세팅
+    // REST 토큰 선세팅(일부 환경 초기 레이스 회피)
     try { client.rest.setToken(token); } catch {}
 
-    // Disconnected 상황만 destroy로 정리(정상 Ready 중엔 파괴하지 않음)
+    // 게이트웨이가 완전 끊긴 상태면 정리
     if (client.ws?.status === Status.Disconnected) {
       try { await client.destroy(); } catch {}
     }
 
     await client.login(token);
 
-    // login 이후에도 한 번 더 확실히 세팅
+    // login 이후에도 한 번 더 세팅
     try { client.rest.setToken(token); } catch {}
 
     console.log("✅ safeLogin success");
@@ -124,12 +124,24 @@ async function sendSpoilerAndMaybeDelete({ channel, text, attachments, authorNam
   });
 
   if (canDelete && messageId) {
-    // 메시지 fetch 없이 ID로 바로 삭제 시도 (ManageMessages 필요)
+    // 메시지 fetch 없이 ID만으로 삭제 시도
     await channel.messages.delete(messageId).catch((e) => {
       console.error("⚠️ delete fail (ignored):", e?.message || e);
     });
   }
 }
+
+// ---------- global dedupe ----------
+const processedIds = new Map(); // messageId -> ts
+function wasProcessed(id) { return processedIds.has(id); }
+function markProcessed(id) { processedIds.set(id, Date.now()); }
+// 10분 TTL 청소
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, ts] of processedIds) {
+    if (now - ts > 10 * 60 * 1000) processedIds.delete(id);
+  }
+}, 60 * 1000);
 
 // ---------- events ----------
 client.once("ready", async () => {
@@ -175,23 +187,16 @@ client.on("invalidated", () => {
   console.warn("🚫 Session invalidated → safe re-login");
   safeLogin("invalidated");
 });
+client.on("error", (e) => { console.error("⚙️ Discord client error:", e?.message || e); });
+client.on("shardReconnecting", (_, id) => { console.warn(`♻️ Shard ${id} reconnecting...`); });
+client.on("shardResume",      (_, id) => { console.log(`🔗 Shard ${id} resumed`); });
 
-client.on("error", (e) => {
-  console.error("⚙️ Discord client error:", e?.message || e);
-});
-
-client.on("shardReconnecting", (_, id) => {
-  console.warn(`♻️ Shard ${id} reconnecting...`);
-});
-client.on("shardResume",      (_, id) => {
-  console.log(`🔗 Shard ${id} resumed`);
-});
-
-// ---------- PRIMARY: messageCreate (정상 경로) ----------
+// ---------- PRIMARY: messageCreate ----------
 client.on("messageCreate", async (msg) => {
   try {
     if (!client.isReady()) return;
     if (msg.author?.bot) return;
+    if (wasProcessed(msg.id)) return; // RAW가 먼저 처리했을 수 있음
     if (!isParentOrSameChannel(msg.channel, SPOILER_CHANNEL_ID)) return;
 
     console.log("[DBG] messageCreate", {
@@ -219,6 +224,8 @@ client.on("messageCreate", async (msg) => {
       canDelete,
       messageId: msg.id,
     });
+
+    markProcessed(msg.id);
   } catch (err) {
     console.error("💥 messageCreate handler error:", err?.message || err);
   }
@@ -233,6 +240,10 @@ client.on("raw", async (p) => {
     const d = p.d || {};
     const channelId = d.channel_id;
     const messageId = d.id;
+
+    // messageCreate가 먼저 처리할 시간을 잠깐 준 뒤 확인
+    await new Promise(r => setTimeout(r, 300));
+    if (wasProcessed(messageId)) return;
 
     const channel = await client.channels.fetch(channelId).catch(() => null);
     if (!channel) return;
@@ -267,6 +278,8 @@ client.on("raw", async (p) => {
       canDelete,
       messageId,
     });
+
+    markProcessed(messageId);
   } catch (e) {
     console.error("💥 RAW handler error:", e?.message || e);
   }
