@@ -6,7 +6,6 @@ const {
   AttachmentBuilder,
   PermissionFlagsBits,
   Partials,
-  Status,
 } = require("discord.js");
 
 // ---------- tiny web server (Render port binding) ----------
@@ -32,32 +31,9 @@ const RAW_DELAY_MS = 300;         // raw 백업 지연
 const DUPE_WINDOW_MS = 5_000;     // 최근 중복 판단 시간창
 const DUPE_FETCH_LIMIT = 10;      // 최근 몇 개 확인할지
 
-// ---------- login manager (token hard-set + event-driven relogin) ----------
-let loggingIn = false;
-async function safeLogin(reason = "manual") {
-  if (loggingIn) return;
-  loggingIn = true;
-  try {
-    const token = process.env.DISCORD_TOKEN;
-    if (!token) throw new Error("DISCORD_TOKEN is empty");
-    console.log(`🔐 safeLogin start (${reason})`);
-    try { client.rest.setToken(token); } catch {}
-    if (client.ws?.status === Status.Disconnected) {
-      try { await client.destroy(); } catch {}
-    }
-    await client.login(token);
-    try { client.rest.setToken(token); } catch {}
-    console.log("✅ safeLogin success");
-  } catch (e) {
-    console.error("❌ safeLogin failed:", e?.message || e);
-  } finally {
-    loggingIn = false;
-  }
-}
-async function loginBot() { return safeLogin("initial"); }
-
-// ---------- keepalive / watchdog ----------
+// ---------- keepalive (Render 깨우기용, Discord와 상관없음) ----------
 const fetchLazy = (...args) => import("node-fetch").then(({ default: fetch }) => fetch(...args));
+
 setInterval(async () => {
   try {
     if (!client?.ws || typeof client.ws.ping !== "number") {
@@ -65,19 +41,15 @@ setInterval(async () => {
       return;
     }
     console.log(`💓 Keepalive ping (1min) – ${client.ws.ping}ms`);
-    if (client.isReady()) { try { client.user.setPresence({ status: "online" }); } catch {} }
+    if (client.isReady()) {
+      try { client.user.setPresence({ status: "online" }); } catch {}
+    }
     const selfUrl = process.env.RENDER_EXTERNAL_URL || "https://discord-bot-atg4.onrender.com";
     await fetchLazy(selfUrl).then(() => console.log("🌍 Self-ping sent"));
   } catch (err) {
     console.error("Ping task error (ignored):", err?.message || err);
   }
 }, 60 * 1000);
-setInterval(() => {
-  if (client.ws?.status === Status.Disconnected) {
-    console.warn("🛠️ Watchdog: Disconnected → safe re-login");
-    safeLogin("watchdog");
-  }
-}, 45 * 1000);
 
 // ---------- utils ----------
 function isParentOrSameChannel(channel, parentId) {
@@ -86,11 +58,13 @@ function isParentOrSameChannel(channel, parentId) {
   if (channel.isThread?.() && channel.parentId === parentId) return true;
   return false;
 }
+
 function wrapSpoiler(text) {
   if (!text) return "";
   const already = /^(\|\|)[\s\S]*\1$/.test(text.trim());
   return already ? text : `||${text}||`;
 }
+
 async function downloadAsAttachment(url, nameHint) {
   const res = await fetchLazy(url);
   const buf = Buffer.from(await res.arrayBuffer());
@@ -98,24 +72,36 @@ async function downloadAsAttachment(url, nameHint) {
 }
 
 // **크로스-인스턴스 중복 방지: 최근 히스토리 검사**
+const DUPE_WINDOW = DUPE_WINDOW_MS;
 async function isRecentDuplicate({ channel, content, filesCount }) {
   try {
     const now = Date.now();
     const msgs = await channel.messages.fetch({ limit: DUPE_FETCH_LIMIT }).catch(() => null);
     if (!msgs) return false;
+
     for (const [, m] of msgs) {
       if (m.author?.id !== client.user.id) continue; // 내 봇이 올린 것만 비교
       const age = now - m.createdTimestamp;
-      if (age > DUPE_WINDOW_MS) continue;
+      if (age > DUPE_WINDOW) continue;
+
       const sameContent = (m.content || "") === (content || "");
       const sameFiles = (m.attachments?.size || 0) === (filesCount || 0);
       if (sameContent && sameFiles) return true;
     }
     return false;
-  } catch { return false; }
+  } catch {
+    return false;
+  }
 }
 
-async function sendSpoilerAndMaybeDelete({ channel, text, attachments, authorName, canDelete, messageId }) {
+async function sendSpoilerAndMaybeDelete({
+  channel,
+  text,
+  attachments,
+  authorName,
+  canDelete,
+  messageId,
+}) {
   const files = [];
   for (const att of attachments || []) {
     try {
@@ -124,6 +110,7 @@ async function sendSpoilerAndMaybeDelete({ channel, text, attachments, authorNam
       console.error("⚠️ attachment fetch fail:", e?.message || e);
     }
   }
+
   const content = `${authorName ? authorName + ": " : ""}${wrapSpoiler(text || "")}`;
   if (!content && files.length === 0) {
     console.log("ℹ️ nothing to send (no text/attachments)");
@@ -161,6 +148,7 @@ setInterval(() => {
 client.once("ready", async () => {
   console.log(`🤖 Logged in as ${client.user.tag}`);
   console.log(`🎯 Target channel: ${SPOILER_CHANNEL_ID}`);
+
   try {
     const ch = await client.channels.fetch(SPOILER_CHANNEL_ID);
     const me = ch.guild?.members?.me;
@@ -176,7 +164,7 @@ client.once("ready", async () => {
       AttachFiles: has(PermissionFlagsBits.AttachFiles),
     });
 
-    // 안정화 대기 후 전송권한 프로브
+    // 가볍게 전송권한만 확인 (문제 없으면 그대로 두면 됨)
     await new Promise(r => setTimeout(r, 1200));
     await ch.send("🧪 Bot write probe (will delete)");
     console.log("✅ write probe: sent");
@@ -187,21 +175,27 @@ client.once("ready", async () => {
         await last.delete().catch(() => {});
         console.log("✅ write probe: deleted");
       }
-    } else {
-      console.log("ℹ️ ManageMessages 없음 → probe 메시지는 남아있을 수 있음");
     }
   } catch (e) {
     console.error("❌ write probe fail:", e?.message || e);
   }
 });
 
+// 세션 완전 파괴될 때만 → 프로세스 종료 → Render가 재시작
 client.on("invalidated", () => {
-  console.warn("🚫 Session invalidated → safe re-login");
-  safeLogin("invalidated");
+  console.error("🚫 Session invalidated — exiting for clean restart");
+  process.exit(1);
 });
-client.on("error", (e) => { console.error("⚙️ Discord client error:", e?.message || e); });
-client.on("shardReconnecting", (_, id) => { console.warn(`♻️ Shard ${id} reconnecting...`); });
-client.on("shardResume",      (_, id) => { console.log(`🔗 Shard ${id} resumed`); });
+
+client.on("error", (e) => {
+  console.error("⚙️ Discord client error:", e?.message || e);
+});
+client.on("shardReconnecting", (_, id) => {
+  console.warn(`♻️ Shard ${id} reconnecting (auto by discord.js)...`);
+});
+client.on("shardResume", (_, id) => {
+  console.log(`🔗 Shard ${id} resumed`);
+});
 
 // ---------- PRIMARY: messageCreate ----------
 client.on("messageCreate", async (msg) => {
@@ -297,8 +291,21 @@ client.on("raw", async (p) => {
 
 // ---------- hardening ----------
 process.on("unhandledRejection", (r) => console.error("🚨 Unhandled:", r));
-process.on("uncaughtException", (e) => console.error("💥 Uncaught:", e));
+process.on("uncaughtException", (e) => {
+  console.error("💥 Uncaught:", e?.message || e);
+  // 치명적 에러면 프로세스 종료 → Render가 재시작
+  process.exit(1);
+});
 
 // ---------- start ----------
-loginBot();
+const token = process.env.DISCORD_TOKEN;
+if (!token) {
+  console.error("❌ DISCORD_TOKEN is not set");
+  process.exit(1);
+}
+client.login(token).catch((e) => {
+  console.error("❌ Login failed:", e?.message || e);
+  process.exit(1);
+});
+
 setInterval(() => console.log("⏱️ heartbeat – bot should be alive"), 10 * 60 * 1000);
